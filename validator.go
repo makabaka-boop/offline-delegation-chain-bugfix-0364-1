@@ -31,7 +31,7 @@ type Token struct {
 	Issuer    string   `json:"issuer"`
 	Subject   string   `json:"subject"`
 	Actions   []string `json:"actions"`
-	Path      string   `json:"path"` // resource path prefix, segment-boundary matched
+	Path      string   `json:"path"` // resource path prefix; canonicalized (dot segments resolved) before segment-boundary matching
 	NotBefore int64    `json:"not_before"`
 	NotAfter  int64    `json:"not_after"` // half-open interval [NotBefore, NotAfter)
 	Depth     int64    `json:"depth"`     // remaining delegation layers; must strictly decrease along a chain
@@ -55,25 +55,31 @@ type Input struct {
 }
 
 // LayerEvidence records one chain layer and how it narrowed its parent.
+// Path is the raw signed field; CanonicalPath is the resource identity the
+// decision was actually made on.
 type LayerEvidence struct {
-	TokenID   string   `json:"token_id"`
-	Issuer    string   `json:"issuer"`
-	Subject   string   `json:"subject"`
-	Actions   []string `json:"actions"`
-	Path      string   `json:"path"`
-	NotBefore int64    `json:"not_before"`
-	NotAfter  int64    `json:"not_after"`
-	Depth     int64    `json:"depth"`
-	Narrowing string   `json:"narrowing"`
+	TokenID       string   `json:"token_id"`
+	Issuer        string   `json:"issuer"`
+	Subject       string   `json:"subject"`
+	Actions       []string `json:"actions"`
+	Path          string   `json:"path"`
+	CanonicalPath string   `json:"canonical_path"`
+	NotBefore     int64    `json:"not_before"`
+	NotAfter      int64    `json:"not_after"`
+	Depth         int64    `json:"depth"`
+	Narrowing     string   `json:"narrowing"`
 }
 
 // RequestCheck records the leaf token the request was matched against.
+// Resource is the raw request field; CanonicalResource is the resource
+// identity the decision was actually made on.
 type RequestCheck struct {
-	Subject   string `json:"subject"`
-	Action    string `json:"action"`
-	Resource  string `json:"resource"`
-	Time      int64  `json:"time"`
-	LeafToken string `json:"leaf_token"`
+	Subject           string `json:"subject"`
+	Action            string `json:"action"`
+	Resource          string `json:"resource"`
+	CanonicalResource string `json:"canonical_resource"`
+	Time              int64  `json:"time"`
+	LeafToken         string `json:"leaf_token"`
 }
 
 // Result is the CLI output document.
@@ -89,7 +95,7 @@ type Result struct {
 type parsedToken struct {
 	tok       *Token
 	actionSet map[string]bool
-	segments  []string // path split into segments
+	segments  []string // canonical path segments: empty/"." dropped, ".." resolved
 }
 
 // canonicalKey decodes a base64 Ed25519 public key and re-encodes it
@@ -158,16 +164,45 @@ func payload(t *Token) []byte {
 	return buf.Bytes()
 }
 
-// splitPath reduces a path to its non-empty segments so that prefix matching
-// happens on segment boundaries: "/a/b" matches "/a/b/c" but not "/a/bc".
-func splitPath(p string) []string {
+// canonicalSegments reduces a resource path to its canonical identity: empty
+// segments (leading, trailing, or duplicate separators) and "." segments are
+// dropped, and ".." pops the previous segment (a ".." at the root is dropped,
+// as the path cannot rise above the root). Prefix matching, narrowing, and
+// evidence all operate on this identity, so equivalent spellings of the same
+// resource decide identically and a ".." cannot escape the granted prefix.
+func canonicalSegments(p string) []string {
 	var out []string
 	for _, s := range strings.Split(p, "/") {
-		if s != "" {
+		switch s {
+		case "", ".":
+			// drop: no effect on the resource identity
+		case "..":
+			if len(out) > 0 {
+				out = out[:len(out)-1]
+			}
+		default:
 			out = append(out, s)
 		}
 	}
 	return out
+}
+
+// canonicalPath renders canonical segments in standard form: "/" followed by
+// the segments joined with "/"; the empty (root) identity renders as "/".
+func canonicalPath(segs []string) string {
+	if len(segs) == 0 {
+		return "/"
+	}
+	return "/" + strings.Join(segs, "/")
+}
+
+// pathNote quotes a raw path and, when its canonical identity differs, shows
+// that too, so the output always reflects the identity the decision used.
+func pathNote(raw string, segs []string) string {
+	if c := canonicalPath(segs); c != raw {
+		return fmt.Sprintf("%q (canonical %q)", raw, c)
+	}
+	return fmt.Sprintf("%q", raw)
 }
 
 // pathWithin reports whether child lies under (or equals) the parent prefix.
@@ -306,7 +341,7 @@ func Validate(in *Input) Result {
 		pt := &parsedToken{
 			tok:       tk,
 			actionSet: make(map[string]bool, len(tk.Actions)),
-			segments:  splitPath(tk.Path),
+			segments:  canonicalSegments(tk.Path),
 		}
 		for _, a := range tk.Actions {
 			pt.actionSet[a] = true
@@ -374,7 +409,7 @@ func Validate(in *Input) Result {
 	}
 
 	req := &in.Request
-	reqSegments := splitPath(req.Resource)
+	reqSegments := canonicalSegments(req.Resource)
 	leafOK := func(pt *parsedToken) bool {
 		return pt.tok.Subject == reqSubject &&
 			pt.actionSet[req.Action] &&
@@ -448,11 +483,12 @@ func Validate(in *Input) Result {
 		Chain:    chainIDs(live, chain),
 		Evidence: buildEvidence(live, chain),
 		Request: &RequestCheck{
-			Subject:   req.Subject,
-			Action:    req.Action,
-			Resource:  req.Resource,
-			Time:      req.Time,
-			LeafToken: live[cur].tok.ID,
+			Subject:           req.Subject,
+			Action:            req.Action,
+			Resource:          req.Resource,
+			CanonicalResource: canonicalPath(reqSegments),
+			Time:              req.Time,
+			LeafToken:         live[cur].tok.ID,
 		},
 	}
 }
@@ -462,6 +498,9 @@ func Validate(in *Input) Result {
 func unauthorizedReason(live []*parsedToken, req *Request, reqSubject string, reqSegments []string) string {
 	base := fmt.Sprintf("no valid delegation chain from a trust root to the subject for action %q on %q at time %d",
 		req.Action, req.Resource, req.Time)
+	if c := canonicalPath(reqSegments); c != req.Resource {
+		base += fmt.Sprintf("; canonical resource %q", c)
+	}
 	var hints []string
 	for _, pt := range live {
 		if pt.tok.Subject != reqSubject {
@@ -472,7 +511,7 @@ func unauthorizedReason(live []*parsedToken, req *Request, reqSubject string, re
 			fails = append(fails, "action not granted")
 		}
 		if !pathWithinSeg(pt.segments, reqSegments) {
-			fails = append(fails, fmt.Sprintf("resource outside path prefix %q", pt.tok.Path))
+			fails = append(fails, fmt.Sprintf("resource outside path prefix %s", pathNote(pt.tok.Path, pt.segments)))
 		}
 		if !(pt.tok.NotBefore <= req.Time && req.Time < pt.tok.NotAfter) {
 			fails = append(fails, fmt.Sprintf("time outside validity [%d,%d)", pt.tok.NotBefore, pt.tok.NotAfter))
@@ -503,24 +542,25 @@ func buildEvidence(live []*parsedToken, chain []int) []LayerEvidence {
 		narrowing := "root-issued: chain anchored at a trust root"
 		if i > 0 {
 			prev := live[chain[i-1]]
-			narrowing = fmt.Sprintf("actions {%s} narrowed to {%s}; path %q narrowed to %q; validity [%d,%d) narrowed to [%d,%d); depth %d -> %d",
+			narrowing = fmt.Sprintf("actions {%s} narrowed to {%s}; path %s narrowed to %s; validity [%d,%d) narrowed to [%d,%d); depth %d -> %d",
 				strings.Join(normalizedActions(prev.tok.Actions), ","),
 				strings.Join(normalizedActions(pt.tok.Actions), ","),
-				prev.tok.Path, pt.tok.Path,
+				pathNote(prev.tok.Path, prev.segments), pathNote(pt.tok.Path, pt.segments),
 				prev.tok.NotBefore, prev.tok.NotAfter,
 				pt.tok.NotBefore, pt.tok.NotAfter,
 				prev.tok.Depth, pt.tok.Depth)
 		}
 		ev[i] = LayerEvidence{
-			TokenID:   pt.tok.ID,
-			Issuer:    pt.tok.Issuer,
-			Subject:   pt.tok.Subject,
-			Actions:   normalizedActions(pt.tok.Actions),
-			Path:      pt.tok.Path,
-			NotBefore: pt.tok.NotBefore,
-			NotAfter:  pt.tok.NotAfter,
-			Depth:     pt.tok.Depth,
-			Narrowing: narrowing,
+			TokenID:       pt.tok.ID,
+			Issuer:        pt.tok.Issuer,
+			Subject:       pt.tok.Subject,
+			Actions:       normalizedActions(pt.tok.Actions),
+			Path:          pt.tok.Path,
+			CanonicalPath: canonicalPath(pt.segments),
+			NotBefore:     pt.tok.NotBefore,
+			NotAfter:      pt.tok.NotAfter,
+			Depth:         pt.tok.Depth,
+			Narrowing:     narrowing,
 		}
 	}
 	return ev

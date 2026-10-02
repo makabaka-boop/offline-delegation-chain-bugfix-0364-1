@@ -191,6 +191,44 @@ func TestNearPaths(t *testing.T) {
 	}
 }
 
+// TestRequestPathCanonicalization: the decision must be made on the
+// canonical resource identity, so "." / ".." / duplicate separators cannot
+// smuggle the resource outside the granted prefix, and equivalent spellings
+// of the same resource get the same verdict.
+func TestRequestPathCanonicalization(t *testing.T) {
+	rootPub, rootPriv := genKey(t)
+	aPub, _ := genKey(t)
+	tok := mint("t1", rootPub, rootPriv, aPub, []string{"read"}, "/docs/team/", 0, 100, 0)
+
+	for _, tc := range []struct {
+		resource string
+		want     string
+	}{
+		{"/docs/team/a.txt", StatusAuthorized},           // baseline
+		{"/docs//team///a.txt", StatusAuthorized},        // duplicate separators
+		{"/docs/./team/./a.txt", StatusAuthorized},       // dot segments
+		{"/docs/team/sub/../a.txt", StatusAuthorized},    // ".." stays inside the prefix
+		{"/docs/x/../team/a.txt", StatusAuthorized},      // ".." leaves and re-enters
+		{"/docs/team/", StatusAuthorized},                // the prefix itself, trailing slash
+		{"/docs/team/.", StatusAuthorized},               // the prefix itself, via "."
+		{"/docs/team/../etc/passwd", StatusUnauthorized}, // escapes the prefix
+		{"/docs/team/../../etc/passwd", StatusUnauthorized},
+		{"/docs/../etc/passwd", StatusUnauthorized}, // never enters the prefix
+		{"/../docs/team/a.txt", StatusAuthorized},   // ".." at the root is dropped: canonical "/docs/team/a.txt"
+		{"/docs/team/..", StatusUnauthorized},       // canonical "/docs" is above the prefix
+		{"/docs/team/../team", StatusAuthorized},    // canonical "/docs/team" == the prefix
+	} {
+		in := &Input{
+			Roots:   []string{rootPub},
+			Tokens:  []Token{tok},
+			Request: Request{Subject: aPub, Action: "read", Resource: tc.resource, Time: 50},
+		}
+		if res := Validate(in); res.Status != tc.want {
+			t.Errorf("resource %q: status = %q (%s), want %q", tc.resource, res.Status, res.Reason, tc.want)
+		}
+	}
+}
+
 func TestChildPathMustNarrowOnSegmentBoundary(t *testing.T) {
 	rootPub, rootPriv := genKey(t)
 	aPub, aPriv := genKey(t)
@@ -215,6 +253,113 @@ func TestChildPathMustNarrowOnSegmentBoundary(t *testing.T) {
 	in.Request.Resource = "/a/b/c/f"
 	if res := Validate(in); res.Status != StatusAuthorized {
 		t.Fatalf("status = %q (%s), want authorized", res.Status, res.Reason)
+	}
+}
+
+// TestTokenPathCanonicalizedForNarrowing: narrowing between delegation
+// layers is judged on canonical path identities, so an oddly spelled parent
+// prefix still matches a clean child, and a child whose canonical identity
+// escapes the parent breaks the chain.
+func TestTokenPathCanonicalizedForNarrowing(t *testing.T) {
+	rootPub, rootPriv := genKey(t)
+	aPub, aPriv := genKey(t)
+	bPub, _ := genKey(t)
+
+	// The parent's canonical identity is "/a/b" despite the odd spelling.
+	parent := mint("t1", rootPub, rootPriv, aPub, []string{"read"}, "/a/./b/", 0, 100, 2)
+	child := mint("t2", aPub, aPriv, bPub, []string{"read"}, "/a/b//c", 0, 100, 1)
+	in := &Input{
+		Roots:   []string{rootPub},
+		Tokens:  []Token{parent, child},
+		Request: Request{Subject: bPub, Action: "read", Resource: "/a/b/c/f", Time: 50},
+	}
+	if res := Validate(in); res.Status != StatusAuthorized {
+		t.Fatalf("status = %q (%s), want authorized", res.Status, res.Reason)
+	}
+
+	// "/a/b/../c" canonicalizes to "/a/c", which is NOT under "/a/b": the
+	// child widens the path and the chain must break.
+	sneaky := mint("t2", aPub, aPriv, bPub, []string{"read"}, "/a/b/../c", 0, 100, 1)
+	in.Tokens = []Token{parent, sneaky}
+	in.Request.Resource = "/a/c/f"
+	if res := Validate(in); res.Status != StatusUnauthorized {
+		t.Fatalf("status = %q, want unauthorized", res.Status)
+	}
+}
+
+// TestSignatureBindsRawPath: the signature covers the raw path field; the
+// canonical identity is derived from that signed field. Rewriting the raw
+// path — even to an equivalent spelling — invalidates the signature.
+func TestSignatureBindsRawPath(t *testing.T) {
+	rootPub, rootPriv := genKey(t)
+	aPub, _ := genKey(t)
+	tok := mint("t1", rootPub, rootPriv, aPub, []string{"read"}, "/a/./b", 0, 100, 0)
+	in := &Input{
+		Roots:   []string{rootPub},
+		Tokens:  []Token{tok},
+		Request: Request{Subject: aPub, Action: "read", Resource: "/a/b/x", Time: 50},
+	}
+	if res := Validate(in); res.Status != StatusAuthorized {
+		t.Fatalf("status = %q (%s), want authorized", res.Status, res.Reason)
+	}
+
+	tok.Path = "/a/b" // same canonical identity, different signed bytes
+	in.Tokens = []Token{tok}
+	if res := Validate(in); res.Status != StatusRejected {
+		t.Fatalf("status = %q, want rejected", res.Status)
+	}
+}
+
+// TestCanonicalIdentityInOutput: the authorized output exposes the canonical
+// resource identity the decision was made on, per layer and for the request,
+// alongside the raw signed fields.
+func TestCanonicalIdentityInOutput(t *testing.T) {
+	f := newChainFixture(t)
+	in := f.input()
+	in.Request.Resource = "/docs//team/./report.txt"
+	res := Validate(in)
+	if res.Status != StatusAuthorized {
+		t.Fatalf("status = %q (%s), want authorized", res.Status, res.Reason)
+	}
+	if got := res.Request.CanonicalResource; got != "/docs/team/report.txt" {
+		t.Errorf("canonical resource = %q, want /docs/team/report.txt", got)
+	}
+	if got := res.Evidence[0].CanonicalPath; got != "/docs" {
+		t.Errorf("layer 1 canonical path = %q, want /docs", got)
+	}
+	if got := res.Evidence[1].CanonicalPath; got != "/docs/team" {
+		t.Errorf("layer 2 canonical path = %q, want /docs/team", got)
+	}
+	// The raw signed fields remain visible for audit.
+	if got := res.Evidence[1].Path; got != "/docs/team/" {
+		t.Errorf("layer 2 raw path = %q, want /docs/team/", got)
+	}
+	if got := res.Request.Resource; got != "/docs//team/./report.txt" {
+		t.Errorf("raw resource = %q, want the spelling from the request", got)
+	}
+}
+
+// TestRevocationAndValidityUseCanonicalIdentity: with a non-canonical
+// request spelling, revocation and validity checks still apply to the chain
+// selected by the canonical resource identity.
+func TestRevocationAndValidityUseCanonicalIdentity(t *testing.T) {
+	f := newChainFixture(t)
+	build := func(revoked ...string) *Input {
+		in := f.input()
+		in.Request.Resource = "/docs/team/../team/report.txt" // canonical "/docs/team/report.txt"
+		in.Revoked = revoked
+		return in
+	}
+	if res := Validate(build()); res.Status != StatusAuthorized {
+		t.Fatalf("baseline: status = %q (%s), want authorized", res.Status, res.Reason)
+	}
+	if res := Validate(build("t2")); res.Status != StatusUnauthorized {
+		t.Errorf("leaf revoked: status = %q, want unauthorized", res.Status)
+	}
+	expired := build()
+	expired.Request.Time = 180 // outside the leaf's [120,180) window
+	if res := Validate(expired); res.Status != StatusUnauthorized {
+		t.Errorf("expired: status = %q, want unauthorized", res.Status)
 	}
 }
 

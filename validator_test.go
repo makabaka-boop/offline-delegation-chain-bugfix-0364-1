@@ -491,6 +491,155 @@ func TestUnknownSubjectIsUnauthorized(t *testing.T) {
 	}
 }
 
+// TestPathTraversalRejected covers request spellings that contain ".", ".."
+// or duplicate separators. The verdict must always be made on the canonical
+// resource identity, never on the raw segment list.
+func TestPathTraversalRejected(t *testing.T) {
+	rootPub, rootPriv := genKey(t)
+	aPub, _ := genKey(t)
+	// Signed prefix is /docs/; canonicalization must not widen it.
+	tok := mint("t1", rootPub, rootPriv, aPub, []string{"read"}, "/docs/", 0, 100, 0)
+
+	build := func(resource string) *Input {
+		return &Input{
+			Roots:   []string{rootPub},
+			Tokens:  []Token{tok},
+			Request: Request{Subject: aPub, Action: "read", Resource: resource, Time: 50},
+		}
+	}
+
+	for _, resource := range []string{
+		"/docs/../secret/x", // escapes above the prefix
+		"/docs/team/../../secret/x",
+		"/docs/./../secret/x",
+		"/..", // root escape attempt; canonicalizes to "/"
+	} {
+		if res := Validate(build(resource)); res.Status != StatusUnauthorized {
+			t.Errorf("resource %q: status = %q (%s), want unauthorized",
+				resource, res.Status, res.Reason)
+		}
+	}
+}
+
+// TestEquivalentPathSpellingsAgree proves that every spelling of the same
+// canonical resource yields the same verdict, the same chosen chain, and the
+// same canonical identity in the evidence.
+func TestEquivalentPathSpellingsAgree(t *testing.T) {
+	f := newChainFixture(t)
+	canonical := "/docs/team/a.txt"
+	for _, resource := range []string{
+		"/docs/team/a.txt",
+		"/docs//team/a.txt",     // duplicate separator
+		"/docs/./team/a.txt",    // "." segment
+		"/docs/team/x/../a.txt", // ".." that stays inside
+		"/docs/team//a.txt/",    // trailing slash and double slash
+		"/other/../docs/team/a.txt",
+	} {
+		in := f.input()
+		in.Request.Resource = resource
+		res := Validate(in)
+		if res.Status != StatusAuthorized {
+			t.Errorf("resource %q: status = %q (%s), want authorized",
+				resource, res.Status, res.Reason)
+			continue
+		}
+		if got := strings.Join(res.Chain, ","); got != "t1,t2" {
+			t.Errorf("resource %q: chain = %q, want t1,t2", resource, got)
+		}
+		if res.Request == nil || res.Request.CanonicalResource != canonical {
+			t.Errorf("resource %q: canonical resource = %v, want %q",
+				resource, res.Request, canonical)
+		}
+		if res.Evidence[1].CanonicalPath != "/docs/team" {
+			t.Errorf("resource %q: leaf canonical path = %q, want /docs/team",
+				resource, res.Evidence[1].CanonicalPath)
+		}
+	}
+}
+
+// TestDelegationNarrowingUsesCanonicalPath ensures a child token whose signed
+// path normalizes outside the parent prefix cannot form an edge, even though a
+// raw segment-by-segment prefix check would be fooled.
+func TestDelegationNarrowingUsesCanonicalPath(t *testing.T) {
+	rootPub, rootPriv := genKey(t)
+	aPub, aPriv := genKey(t)
+	bPub, _ := genKey(t)
+	parent := mint("t1", rootPub, rootPriv, aPub, []string{"read"}, "/a/b", 0, 100, 2)
+
+	// Raw spelling looks nested ("a","b","..","c") but canonicalizes to /a/c,
+	// which is outside /a/b.
+	escaping := mint("t2", aPub, aPriv, bPub, []string{"read"}, "/a/b/../c", 0, 100, 1)
+	in := &Input{
+		Roots:   []string{rootPub},
+		Tokens:  []Token{parent, escaping},
+		Request: Request{Subject: bPub, Action: "read", Resource: "/a/c/f", Time: 50},
+	}
+	if res := Validate(in); res.Status != StatusUnauthorized {
+		t.Fatalf("escaping child: status = %q (%s), want unauthorized", res.Status, res.Reason)
+	}
+
+	// Same trick that canonicalizes back inside /a/b must authorize, and the
+	// evidence must carry the canonical identity.
+	staying := mint("t2", aPub, aPriv, bPub, []string{"read"}, "/a/b/./c", 0, 100, 1)
+	in.Tokens = []Token{parent, staying}
+	in.Request.Resource = "/a/b//c/f"
+	res := Validate(in)
+	if res.Status != StatusAuthorized {
+		t.Fatalf("staying child: status = %q (%s), want authorized", res.Status, res.Reason)
+	}
+	if got := res.Evidence[1].CanonicalPath; got != "/a/b/c" {
+		t.Errorf("child canonical path = %q, want /a/b/c", got)
+	}
+	if !strings.Contains(res.Evidence[1].Narrowing, `canonical path "/a/b" narrowed to "/a/b/c"`) {
+		t.Errorf("narrowing evidence not based on canonical paths: %q", res.Evidence[1].Narrowing)
+	}
+	if res.Request.CanonicalResource != "/a/b/c/f" {
+		t.Errorf("canonical resource = %q, want /a/b/c/f", res.Request.CanonicalResource)
+	}
+}
+
+// TestMalformedPathsRejectBatch enforces absolute-path inputs (fail closed).
+func TestMalformedPathsRejectBatch(t *testing.T) {
+	rootPub, rootPriv := genKey(t)
+	aPub, _ := genKey(t)
+
+	t.Run("relative request resource", func(t *testing.T) {
+		tok := mint("t1", rootPub, rootPriv, aPub, []string{"read"}, "/r/", 0, 100, 0)
+		in := &Input{
+			Roots:   []string{rootPub},
+			Tokens:  []Token{tok},
+			Request: Request{Subject: aPub, Action: "read", Resource: "r/x", Time: 50},
+		}
+		if res := Validate(in); res.Status != StatusRejected {
+			t.Fatalf("status = %q, want rejected", res.Status)
+		}
+	})
+
+	t.Run("empty request resource", func(t *testing.T) {
+		tok := mint("t1", rootPub, rootPriv, aPub, []string{"read"}, "/r/", 0, 100, 0)
+		in := &Input{
+			Roots:   []string{rootPub},
+			Tokens:  []Token{tok},
+			Request: Request{Subject: aPub, Action: "read", Resource: "", Time: 50},
+		}
+		if res := Validate(in); res.Status != StatusRejected {
+			t.Fatalf("status = %q, want rejected", res.Status)
+		}
+	})
+
+	t.Run("relative token path", func(t *testing.T) {
+		tok := mint("t1", rootPub, rootPriv, aPub, []string{"read"}, "r/", 0, 100, 0)
+		in := &Input{
+			Roots:   []string{rootPub},
+			Tokens:  []Token{tok},
+			Request: Request{Subject: aPub, Action: "read", Resource: "/r/x", Time: 50},
+		}
+		if res := Validate(in); res.Status != StatusRejected {
+			t.Fatalf("status = %q, want rejected", res.Status)
+		}
+	})
+}
+
 // TestCLI builds the binary and exercises exit codes and JSON output.
 func TestCLI(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "validator")

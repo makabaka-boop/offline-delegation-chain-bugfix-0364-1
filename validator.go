@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 )
@@ -56,24 +57,26 @@ type Input struct {
 
 // LayerEvidence records one chain layer and how it narrowed its parent.
 type LayerEvidence struct {
-	TokenID   string   `json:"token_id"`
-	Issuer    string   `json:"issuer"`
-	Subject   string   `json:"subject"`
-	Actions   []string `json:"actions"`
-	Path      string   `json:"path"`
-	NotBefore int64    `json:"not_before"`
-	NotAfter  int64    `json:"not_after"`
-	Depth     int64    `json:"depth"`
-	Narrowing string   `json:"narrowing"`
+	TokenID       string   `json:"token_id"`
+	Issuer        string   `json:"issuer"`
+	Subject       string   `json:"subject"`
+	Actions       []string `json:"actions"`
+	Path          string   `json:"path"`           // raw path covered by the signature
+	CanonicalPath string   `json:"canonical_path"` // normalized resource identity actually enforced
+	NotBefore     int64    `json:"not_before"`
+	NotAfter      int64    `json:"not_after"`
+	Depth         int64    `json:"depth"`
+	Narrowing     string   `json:"narrowing"`
 }
 
 // RequestCheck records the leaf token the request was matched against.
 type RequestCheck struct {
-	Subject   string `json:"subject"`
-	Action    string `json:"action"`
-	Resource  string `json:"resource"`
-	Time      int64  `json:"time"`
-	LeafToken string `json:"leaf_token"`
+	Subject           string `json:"subject"`
+	Action            string `json:"action"`
+	Resource          string `json:"resource"`           // resource spelling from the request
+	CanonicalResource string `json:"canonical_resource"` // normalized identity the verdict was made on
+	Time              int64  `json:"time"`
+	LeafToken         string `json:"leaf_token"`
 }
 
 // Result is the CLI output document.
@@ -89,7 +92,49 @@ type Result struct {
 type parsedToken struct {
 	tok       *Token
 	actionSet map[string]bool
-	segments  []string // path split into segments
+	segments  []string // canonical path split into segments
+	canonical string   // lexical canonical form of tok.Path (path.Clean)
+}
+
+// canonicalPath resolves a resource path to a single lexical identity so that
+// authorization is always decided on the resource, never on its spelling:
+// duplicate separators collapse, "." segments drop, and ".." segments pop the
+// preceding segment ("/a/../b" -> "/b"). Paths must be absolute; a path that
+// escapes above the root is clamped there by path.Clean (e.g. "/../x" -> "/x").
+// Relative or empty paths are rejected (fail closed). The raw string is what
+// the signature covers; the canonical string is what every prefix comparison
+// uses, so the two never get confused.
+func canonicalPath(p string) (string, error) {
+	if p == "" || p[0] != '/' {
+		return "", fmt.Errorf("path %q must be absolute (start with /)", p)
+	}
+	c := path.Clean(p)
+	if c != "/" {
+		c = strings.TrimSuffix(c, "/")
+	}
+	return c, nil
+}
+
+// pathSegments splits a canonical path into its non-empty segments.
+func pathSegments(canonical string) []string {
+	if canonical == "/" {
+		return nil
+	}
+	return strings.Split(strings.TrimPrefix(canonical, "/"), "/")
+}
+
+// pathWithin reports whether child lies under (or equals) the parent prefix.
+// Both must be canonical segment lists.
+func pathWithinSeg(parent, child []string) bool {
+	if len(parent) > len(child) {
+		return false
+	}
+	for i, s := range parent {
+		if child[i] != s {
+			return false
+		}
+	}
+	return true
 }
 
 // canonicalKey decodes a base64 Ed25519 public key and re-encodes it
@@ -156,31 +201,6 @@ func payload(t *Token) []byte {
 	putInt(t.NotAfter)
 	putInt(t.Depth)
 	return buf.Bytes()
-}
-
-// splitPath reduces a path to its non-empty segments so that prefix matching
-// happens on segment boundaries: "/a/b" matches "/a/b/c" but not "/a/bc".
-func splitPath(p string) []string {
-	var out []string
-	for _, s := range strings.Split(p, "/") {
-		if s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
-// pathWithin reports whether child lies under (or equals) the parent prefix.
-func pathWithinSeg(parent, child []string) bool {
-	if len(parent) > len(child) {
-		return false
-	}
-	for i, s := range parent {
-		if child[i] != s {
-			return false
-		}
-	}
-	return true
 }
 
 // narrows reports whether child is a valid delegation from parent: issued by
@@ -275,6 +295,13 @@ func Validate(in *Input) Result {
 		return reject("invalid request subject key: %v", err)
 	}
 
+	// The request resource is normalized once, up front, so every check and the
+	// emitted evidence refer to the same resource identity.
+	reqCanonical, err := canonicalPath(in.Request.Resource)
+	if err != nil {
+		return reject("invalid request resource: %v", err)
+	}
+
 	// Per-token structural checks and duplicate-ID detection.
 	ids := make(map[string]bool, len(in.Tokens))
 	subjects := make(map[string]bool, len(in.Tokens))
@@ -303,10 +330,15 @@ func Validate(in *Input) Result {
 		if tk.NotBefore >= tk.NotAfter {
 			return reject("token %q: empty validity interval [%d,%d)", tk.ID, tk.NotBefore, tk.NotAfter)
 		}
+		canonical, err := canonicalPath(tk.Path)
+		if err != nil {
+			return reject("token %q: invalid path: %v", tk.ID, err)
+		}
 		pt := &parsedToken{
 			tok:       tk,
 			actionSet: make(map[string]bool, len(tk.Actions)),
-			segments:  splitPath(tk.Path),
+			segments:  pathSegments(canonical),
+			canonical: canonical,
 		}
 		for _, a := range tk.Actions {
 			pt.actionSet[a] = true
@@ -374,7 +406,7 @@ func Validate(in *Input) Result {
 	}
 
 	req := &in.Request
-	reqSegments := splitPath(req.Resource)
+	reqSegments := pathSegments(reqCanonical)
 	leafOK := func(pt *parsedToken) bool {
 		return pt.tok.Subject == reqSubject &&
 			pt.actionSet[req.Action] &&
@@ -440,7 +472,7 @@ func Validate(in *Input) Result {
 	}
 
 	if cur < 0 || !leafOK(live[cur]) {
-		return Result{Status: StatusUnauthorized, Reason: unauthorizedReason(live, req, reqSubject, reqSegments)}
+		return Result{Status: StatusUnauthorized, Reason: unauthorizedReason(live, req, reqCanonical, reqSubject, reqSegments)}
 	}
 
 	return Result{
@@ -448,20 +480,21 @@ func Validate(in *Input) Result {
 		Chain:    chainIDs(live, chain),
 		Evidence: buildEvidence(live, chain),
 		Request: &RequestCheck{
-			Subject:   req.Subject,
-			Action:    req.Action,
-			Resource:  req.Resource,
-			Time:      req.Time,
-			LeafToken: live[cur].tok.ID,
+			Subject:           req.Subject,
+			Action:            req.Action,
+			Resource:          req.Resource,
+			CanonicalResource: reqCanonical,
+			Time:              req.Time,
+			LeafToken:         live[cur].tok.ID,
 		},
 	}
 }
 
 // unauthorizedReason explains, per live token naming the subject, why it
 // could not answer the request.
-func unauthorizedReason(live []*parsedToken, req *Request, reqSubject string, reqSegments []string) string {
-	base := fmt.Sprintf("no valid delegation chain from a trust root to the subject for action %q on %q at time %d",
-		req.Action, req.Resource, req.Time)
+func unauthorizedReason(live []*parsedToken, req *Request, reqCanonical string, reqSubject string, reqSegments []string) string {
+	base := fmt.Sprintf("no valid delegation chain from a trust root to the subject for action %q on %q (canonical %q) at time %d",
+		req.Action, req.Resource, reqCanonical, req.Time)
 	var hints []string
 	for _, pt := range live {
 		if pt.tok.Subject != reqSubject {
@@ -472,7 +505,8 @@ func unauthorizedReason(live []*parsedToken, req *Request, reqSubject string, re
 			fails = append(fails, "action not granted")
 		}
 		if !pathWithinSeg(pt.segments, reqSegments) {
-			fails = append(fails, fmt.Sprintf("resource outside path prefix %q", pt.tok.Path))
+			fails = append(fails, fmt.Sprintf("resource %q outside canonical path prefix %q (signed path %q)",
+				reqCanonical, pt.canonical, pt.tok.Path))
 		}
 		if !(pt.tok.NotBefore <= req.Time && req.Time < pt.tok.NotAfter) {
 			fails = append(fails, fmt.Sprintf("time outside validity [%d,%d)", pt.tok.NotBefore, pt.tok.NotAfter))
@@ -480,7 +514,7 @@ func unauthorizedReason(live []*parsedToken, req *Request, reqSubject string, re
 		if len(fails) == 0 {
 			fails = append(fails, "no unrevoked narrowing chain from a trust root")
 		}
-		hints = append(hints, fmt.Sprintf("token %q: %s", pt.tok.ID, strings.Join(fails, ", ")))
+		hints = append(hints, fmt.Sprintf("token %q: %s", pt.tok.ID, strings.Join(fails, "; ")))
 	}
 	if len(hints) == 0 {
 		return base + "; no live token names the subject"
@@ -503,24 +537,26 @@ func buildEvidence(live []*parsedToken, chain []int) []LayerEvidence {
 		narrowing := "root-issued: chain anchored at a trust root"
 		if i > 0 {
 			prev := live[chain[i-1]]
-			narrowing = fmt.Sprintf("actions {%s} narrowed to {%s}; path %q narrowed to %q; validity [%d,%d) narrowed to [%d,%d); depth %d -> %d",
+			narrowing = fmt.Sprintf("actions {%s} narrowed to {%s}; canonical path %q narrowed to %q (signed %q -> %q); validity [%d,%d) narrowed to [%d,%d); depth %d -> %d",
 				strings.Join(normalizedActions(prev.tok.Actions), ","),
 				strings.Join(normalizedActions(pt.tok.Actions), ","),
+				prev.canonical, pt.canonical,
 				prev.tok.Path, pt.tok.Path,
 				prev.tok.NotBefore, prev.tok.NotAfter,
 				pt.tok.NotBefore, pt.tok.NotAfter,
 				prev.tok.Depth, pt.tok.Depth)
 		}
 		ev[i] = LayerEvidence{
-			TokenID:   pt.tok.ID,
-			Issuer:    pt.tok.Issuer,
-			Subject:   pt.tok.Subject,
-			Actions:   normalizedActions(pt.tok.Actions),
-			Path:      pt.tok.Path,
-			NotBefore: pt.tok.NotBefore,
-			NotAfter:  pt.tok.NotAfter,
-			Depth:     pt.tok.Depth,
-			Narrowing: narrowing,
+			TokenID:       pt.tok.ID,
+			Issuer:        pt.tok.Issuer,
+			Subject:       pt.tok.Subject,
+			Actions:       normalizedActions(pt.tok.Actions),
+			Path:          pt.tok.Path,
+			CanonicalPath: pt.canonical,
+			NotBefore:     pt.tok.NotBefore,
+			NotAfter:      pt.tok.NotAfter,
+			Depth:         pt.tok.Depth,
+			Narrowing:     narrowing,
 		}
 	}
 	return ev
